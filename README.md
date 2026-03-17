@@ -1,56 +1,55 @@
 # Bazel + Nx Hybrid Workspace
 
-A demo of calling Nx from Bazel and configuring Nx to invalidate its cache when files outside the Nx workspace change. The Java backend is intentionally minimal — the focus is the integration layer between the two build systems.
+Quick POC showing how to call Nx from Bazel and how to get Nx to bust its cache when files outside the Nx workspace change (in this case, Java source files managed by Bazel).
 
-## Project structure
+The Java stuff here is just a hello-world from the [Bazel Java tutorial](https://bazel.build/start/java) — don't read too much into it. The interesting bits are the genrule bridge and the Nx runtime inputs config.
 
-```
-.
-├── BUILD                   # Java targets + genrule targets that call Nx
-├── MODULE.bazel            # Bazel module config
-├── .bazelignore            # Excludes ui/ from Bazel's package discovery
-├── mise.toml               # Toolchain (Java 21, Bazelisk)
-├── tools/
-│   ├── BUILD
-│   └── nx.sh              # Wrapper script Bazel uses to invoke Nx
-├── src/main/java/…         # Minimal Java app (Bazel-managed)
-└── ui/                     # Nx Angular workspace
-    ├── nx.json            # Runtime inputs for cross-boundary cache invalidation
-    ├── src/               # Angular app
-    └── e2e/               # Playwright e2e tests
-```
-
-## Getting started
+## Setup
 
 ```bash
-mise install                # Install Java 21 + Bazelisk
+mise install                # grabs Java 21 + Bazelisk
 cd ui && npm install && cd ..
 
-# Build Java + Angular in one command
+# build everything
 mise x -- bazel build //:ProjectRunner //:ui_build
 ```
 
-> `mise x --` ensures mise-managed tools are on PATH. If mise is activated in your shell, you can call `bazel` directly.
+If you've got `mise activate` in your shell you can drop the `mise x --` prefix.
+
+## Repo layout
+
+```
+.
+├── BUILD                   # java targets + genrules that shell out to nx
+├── MODULE.bazel
+├── .bazelignore            # keeps bazel away from ui/node_modules
+├── mise.toml               # java 21, bazelisk
+├── tools/
+│   └── nx.sh               # wrapper script that bazel calls
+├── src/main/java/…         # boring hello-world java app
+└── ui/                     # nx angular workspace
+    ├── nx.json             # this is where the runtime inputs magic lives
+    ├── src/
+    └── e2e/
+```
 
 ---
 
-## Calling Nx from Bazel
+## How Bazel calls Nx
 
-The core challenge: Bazel runs actions in an isolated *execroot* with a stripped-down environment. It doesn't know about `node_modules`, `npx`, or anything in the Nx workspace. Three things are needed to bridge this gap.
+Bazel doesn't know anything about node, npm, or Nx. And it runs everything in a sandboxed execroot with a mostly-empty PATH. So we need a few workarounds.
 
-### 1. Exclude ui/ from Bazel
+### .bazelignore
 
-**File:** `.bazelignore`
+First, tell Bazel to completely ignore `ui/`. If you don't, it'll crawl into `node_modules` and choke on BUILD files that npm packages sometimes ship.
 
 ```
 ui
 ```
 
-Bazel must not try to traverse `ui/`. Without this, it would scan `node_modules/` (tens of thousands of files), find conflicting BUILD files from npm packages, and fail.
+### genrules with `local = True`
 
-### 2. genrule targets with `local = True`
-
-**File:** `BUILD`
+In the root `BUILD` file there are genrule targets that shell out to Nx:
 
 ```python
 genrule(
@@ -63,67 +62,36 @@ genrule(
 )
 ```
 
-Four genrule targets delegate to Nx: `ui_build`, `ui_test`, `ui_lint`, `ui_e2e`.
+`local = True` is the key bit. Without it, Bazel sandboxes the action and Nx can't see `node_modules` or any of the UI source files. With it, the genrule runs directly on your machine with full filesystem access.
 
-**`local = True`** is critical. Bazel normally sandboxes actions, making only declared inputs available. Nx needs the full `ui/` directory (source files, `node_modules/`, config), none of which Bazel tracks. `local = True` runs the action directly on the host filesystem. The `no-sandbox` tag reinforces this.
+The `.stamp` file is just a dummy output — Bazel requires genrules to produce something. The actual build output ends up in `ui/dist/`. Since local genrules always re-run, all caching happens on the Nx side.
 
-**Stamp files** exist because genrules must declare at least one output. The stamp is a zero-byte marker — the real build output lives in `ui/dist/`. Since Bazel always re-runs local genrules, caching is handled entirely by Nx.
-
-```bash
-mise x -- bazel build //:ui_build   # nx build ui
-mise x -- bazel build //:ui_test    # nx test ui
-mise x -- bazel build //:ui_lint    # nx lint ui
-mise x -- bazel build //:ui_e2e     # nx e2e e2e
-```
-
-### 3. The wrapper script
-
-**File:** `tools/nx.sh`
+There are four of these:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-NX_TARGET="${1:?Usage: nx.sh <target> <project>}"
-NX_PROJECT="${2:?Usage: nx.sh <target> <project>}"
-shift 2
-
-# Resolve workspace root: BUILD_WORKSPACE_DIRECTORY is set by `bazel run`,
-# but not by `bazel build` (genrule). Fall back to resolving symlinks.
-if [ -n "${BUILD_WORKSPACE_DIRECTORY:-}" ]; then
-  WORKSPACE_ROOT="${BUILD_WORKSPACE_DIRECTORY}"
-else
-  SCRIPT_REAL="$(realpath "$0")"
-  WORKSPACE_ROOT="$(cd "$(dirname "${SCRIPT_REAL}")/.." && pwd)"
-fi
-
-UI_DIR="${WORKSPACE_ROOT}/ui"
-cd "${UI_DIR}"
-
-# Bazel strips PATH for hermeticity — restore mise-managed tools.
-MISE_BIN="/opt/homebrew/bin/mise"
-if [ -x "${MISE_BIN}" ]; then
-  eval "$("${MISE_BIN}" env -C "${WORKSPACE_ROOT}" 2>/dev/null)" || true
-fi
-
-exec npx nx "${NX_TARGET}" "${NX_PROJECT}" "$@"
+bazel build //:ui_build   # nx build ui
+bazel build //:ui_test    # nx test ui
+bazel build //:ui_lint    # nx lint ui
+bazel build //:ui_e2e     # nx e2e e2e
 ```
 
-This script solves two problems that arise because Bazel's execution environment is intentionally hostile to non-hermetic tools:
+### tools/nx.sh
 
-**Workspace root resolution.** Genrules run from the execroot, not your source tree. The script follows symlinks from its own real path back to the actual workspace. `bazel run` sets `BUILD_WORKSPACE_DIRECTORY` directly, but `bazel build` (which is what genrules use) does not — hence the fallback.
+The wrapper script deals with two annoying things about running inside a Bazel genrule:
 
-**PATH bootstrapping.** Bazel strips environment variables, so `node`/`npx` aren't available. The script calls mise directly by absolute path to reconstruct the correct PATH before invoking Nx.
+1. **Finding the workspace.** Genrules run from the execroot, not your repo. The script resolves its own real path via symlinks to figure out where the actual source tree is. (`bazel run` sets `BUILD_WORKSPACE_DIRECTORY` but `bazel build` doesn't, so we need the fallback.)
+
+2. **Restoring PATH.** Bazel strips env vars for hermeticity, so `npx` isn't available. The script calls mise by absolute path to put node back on PATH.
 
 ---
 
-## Nx runtime inputs: tracking files outside the workspace
+## Getting Nx to watch files outside its workspace
 
-This is the most interesting part of the integration. Nx only watches files inside its own workspace root (`ui/`). But when Java source files change, the Angular build and e2e tests may need to re-run (e.g., if the frontend consumes an API whose contract changed). Without explicit configuration, Nx would serve stale cached results.
+This is the part I actually wanted to demo. Nx only hashes files inside its own workspace root (`ui/`). If you change a Java file in the parent directory, Nx has no idea and happily serves a stale cached build.
 
-### The mechanism: `runtime` inputs in `namedInputs`
+### Runtime inputs
 
-**File:** `ui/nx.json`
+Nx has this `runtime` input type that lets you run an arbitrary shell command and include its output in the task hash. In `ui/nx.json`:
 
 ```json
 {
@@ -149,30 +117,23 @@ This is the most interesting part of the integration. Nx only watches files insi
 }
 ```
 
-Nx `runtime` inputs run a shell command and include its stdout in the task hash. The `javaSource` named input works like this:
+The `javaSource` input finds all `.java` files in `../src`, hashes their contents, sorts for determinism, and collapses it into one hash. If any java file changes, the hash changes, and Nx treats the build/test/e2e as a cache miss.
 
-1. `find ../src -name '*.java'` — discovers all Java source files (outside `ui/`)
-2. `-exec shasum {} +` — hashes each file's contents
-3. `sort` — deterministic ordering (find doesn't guarantee order)
-4. `shasum` — collapses everything into a single hash
+You wire it up by adding `"javaSource"` to the `inputs` array on whatever targets should care about Java changes.
 
-When any `.java` file is added, removed, or modified, the combined hash changes and Nx treats `build`, `test`, and `e2e` as cache misses.
+### Why not just use file globs?
 
-The `javaSource` input is added to `targetDefaults` for each executor that should be sensitive to Java changes. You can add it to as many or as few targets as needed.
+I tried `{workspaceRoot}/../src/**/*.java` first. Doesn't work — Nx won't resolve globs outside the workspace root. `runtime` is the only way to reach external files.
 
-### Why `runtime` instead of file globs?
+### Why disable the daemon?
 
-Nx's file-based inputs like `{workspaceRoot}/../src/**/*.java` do not work — Nx only resolves globs within its own workspace root. The `runtime` input is the only built-in mechanism that can reach files outside the workspace boundary.
+The Nx daemon caches runtime input results between runs for performance. Problem is, it's too aggressive about it — it won't re-run the `find`/`shasum` command even when the Java files have changed. Turning off the daemon (`"useDaemonProcess": false`) forces Nx to re-evaluate runtime inputs every time.
 
-### Why `useDaemonProcess: false`?
+You pay ~200ms in startup time. Worth it for correct cache behavior.
 
-The Nx daemon caches runtime input results aggressively for performance. When the daemon is running, it may not re-evaluate the `find`/`shasum` command between invocations, causing stale cache hits even after Java files change.
+### This works for anything, not just Java
 
-Setting `useDaemonProcess: false` forces Nx to re-run all runtime commands on every invocation. The trade-off is ~200ms slower startup, but cache correctness matters more in a cross-system integration.
-
-### Adapting this pattern
-
-The runtime input approach is not specific to Java. You can track any external files:
+Same pattern works for any files outside the workspace:
 
 ```json
 "namedInputs": {
@@ -181,34 +142,26 @@ The runtime input approach is not specific to Java. You can track any external f
   ],
   "goModules": [
     { "runtime": "shasum ../go.sum" }
-  ],
-  "dockerConfig": [
-    { "runtime": "shasum ../Dockerfile ../docker-compose.yml" }
   ]
 }
 ```
 
-Any change to the tracked files produces a different hash, invalidating whichever Nx targets include that named input.
-
 ---
 
-## Caching model
+## How caching works end-to-end
 
-| Layer | Tool | What it caches | Invalidation |
-|-------|------|----------------|-------------|
-| Outer | Bazel | Java compilation | Content-addressed (automatic) |
-| Inner | Nx | Angular build, test, lint, e2e | Hash-based with runtime inputs |
+| Layer | Tool | Caches | Invalidation |
+|-------|------|--------|-------------|
+| Outer | Bazel | Java compilation | automatic (content-addressed) |
+| Inner | Nx | Angular build/test/lint/e2e | hash-based, with runtime inputs for java files |
 
-Bazel always re-runs the local genrules (they're non-hermetic by design). Nx decides whether to rebuild or serve from cache. This means caching for the Angular side is entirely controlled by Nx's `inputs` configuration — the runtime `javaSource` input is what makes the cross-boundary invalidation work.
+Bazel always re-runs the local genrules. Nx decides whether to actually rebuild or serve from cache. The runtime input on `javaSource` is what connects the two — without it, Nx would never know the Java side changed.
 
 ---
 
 ## Troubleshooting
 
-**`bazel: command not found`** — Activate mise in your shell (`eval "$(mise activate zsh)"`) or prefix commands with `mise x --`.
-
-**`ui/node_modules not found`** — Run `cd ui && npm install`.
-
-**Nx cache not invalidating after Java changes** — Verify `"useDaemonProcess": false` is set in `ui/nx.json`. Force a clean slate with `npx nx reset` from `ui/`.
-
-**Bazel tries to process ui/node_modules** — Ensure `ui` is listed in `.bazelignore`.
+- **`bazel: command not found`** — run `mise activate` or prefix with `mise x --`
+- **`ui/node_modules not found`** — `cd ui && npm install`
+- **Nx not busting cache after java changes** — check that `"useDaemonProcess": false` is in `ui/nx.json`, or run `npx nx reset` in `ui/` to clear everything
+- **Bazel errors about stuff in node_modules** — make sure `ui` is in `.bazelignore`
