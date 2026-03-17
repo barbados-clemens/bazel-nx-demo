@@ -1,0 +1,16 @@
+# Bazel
+/bazel-*
+
+# Node
+ui/node_modules/
+ui/dist/
+ui/.nx/
+ui/.angular/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

@@ -1,0 +1,3 @@
+[tools]
+bazelisk = "latest"
+java = "21"
